@@ -1,15 +1,28 @@
 import os
 import regex as re
-import multiprocessing
+import pickle
+import os
+import time
 from typing import IO, Any, BinaryIO
 from collections import defaultdict
 from multiprocessing import Pool
+from tqdm.auto import tqdm
+from contextlib import contextmanager
 
 PAT = re.compile(r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+""")
 
+@contextmanager
+def timer(name="Block"):
+    start = time.perf_counter()
+    yield
+    end = time.perf_counter()
+    print(f"{name} took {end - start:.4f} seconds")
+
+
+
 def find_chunk_boundaries(
-    file: BinaryIO, 
-    desired_num_chunks: int, 
+    file: BinaryIO,
+    desired_num_chunks: int,
     split_special_token: bytes
 ) -> list[int]:
     """
@@ -55,7 +68,7 @@ def find_chunk_boundaries(
     # Make sure all boundaries are unique, but might be fewer than desired_num_chunks
     return sorted(set(chunk_boundaries))
 
-def intialize_count_dict(chunk, special_token_pattern):
+def initialize_count_dict(chunk, special_token_pattern):
     counts = defaultdict(int)
     sub_chunks = special_token_pattern.split(chunk) if special_token_pattern else [chunk]
     for sub_chunk in sub_chunks:
@@ -75,7 +88,7 @@ def create_byte_pair_count(count_dict):
 def get_most_frequent_pair(count_dict):
     max_count = max(count_dict.values())
     max_val = [k for k, v in count_dict.items() if v == max_count]
-    
+
     return max(
         (k for k, v in count_dict.items() if v == max_count),
         key=lambda x: x  # lexicographically larger wins on tie
@@ -109,15 +122,18 @@ def merge_optimised(token_dict, merge_pair, new_idx, byte_count, vocab):
             else:
                 new_key.append(key[i])
                 i += 1
-        
+
         if modified:
            update_dict[tuple(new_key)] += cnt
            keys_to_delete.append(key)
-    
+
     for k in keys_to_delete:
         token_dict.pop(k, None)
-    # del byte_count[(ind1, ind2)]
-    token_dict.update(update_dict)
+
+    for key, val in update_dict.items():
+        token_dict[key] = token_dict.get(key, 0) + val
+
+    byte_count.pop(merge_pair, None)
 
 
 def get_token_counts(input_path, num_processes, special_tokens):
@@ -132,7 +148,7 @@ def get_token_counts(input_path, num_processes, special_tokens):
             start, end = point
             f.seek(start)
             chunk = f.read(end - start).decode("utf-8", errors="ignore")
-            chunked_count_arr.append(pool.apply_async(intialize_count_dict, (chunk, special_tok_pat)))
+            chunked_count_arr.append(pool.apply_async(initialize_count_dict, (chunk, special_tok_pat)))
         pool.close()
         pool.join()
 
@@ -174,23 +190,42 @@ def train_bpe(
     initial_tokens = [token.encode("UTF-8") for token in special_tokens] + [bytes([i]) for i in range(256)]
     vocab = {i: tok for i, tok in enumerate(initial_tokens)}
     merges = []
-    token_dict = get_token_counts(input_path, 4, special_tokens)
+    with timer("Pre tokenisation"):
+        token_dict = get_token_counts(input_path, os.cpu_count() // 2, special_tokens)
+
     new_idx = len(vocab)
 
-    byte_pair_count_dict = create_byte_pair_count(token_dict)
+    with timer("Initial Byte Pair Count"):
+        byte_pair_count_dict = create_byte_pair_count(token_dict)
 
     num_merges = vocab_size - len(vocab)
-    for _ in range(num_merges):
+
+    for _ in tqdm(range(num_merges)):
+
         most_frequent_pair, cnt = get_most_frequent_pair(byte_pair_count_dict)
+
         merges.append((most_frequent_pair[0], most_frequent_pair[1]))
         vocab[new_idx] = most_frequent_pair[0] + most_frequent_pair[1]
+
         merge_optimised(token_dict, most_frequent_pair, new_idx, byte_pair_count_dict, vocab)
+
         new_idx += 1
+
+    if os.path.exists("output"):
+        with open("output/vocab.pkl", "wb") as f:
+            pickle.dump(vocab, f)
+
+        with open("output/merges.pkl", "wb") as f:
+            pickle.dump(merges, f)
     return (vocab, merges)
 
-if __name__ == "__main__":
-    print(
-        
-        train_bpe("../tests/fixtures/simple.txt", vocab_size=270, special_tokens=['<|endoftext|>'])
+def train_bpe_tinystories(split="validation"):
+    if split == "validation":
+        train_bpe("../tests/fixtures/tinystories_validation.txt", vocab_size=10000, special_tokens=['<|endoftext|>'])
+    elif split == "train":
+        train_bpe("../tests/fixtures/tinystories_train.txt", vocab_size=10000, special_tokens=['<|endoftext|>'])
+    else:
+        raise ValueError(f"Invalid split: {split}")
 
-    )
+if __name__ == "__main__":
+    train_bpe("../tests/fixtures/openwebtext.txt", vocab_size=10000, special_tokens=['<|endoftext|>'])
