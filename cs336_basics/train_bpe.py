@@ -80,10 +80,12 @@ def initialize_count_dict(chunk, special_token_pattern):
 
 def create_byte_pair_count(count_dict):
     byte_pair_count_dict = defaultdict(int)
+    byte_pair_to_token = defaultdict(set)
     for key, cnt in count_dict.items():
         for ind1, ind2 in zip(key, key[1:]):
             byte_pair_count_dict[(ind1, ind2)] += cnt
-    return byte_pair_count_dict
+            byte_pair_to_token[(ind1, ind2)].add(key)
+    return byte_pair_count_dict, byte_pair_to_token
 
 def get_most_frequent_pair(count_dict):
     max_count = max(count_dict.values())
@@ -95,44 +97,42 @@ def get_most_frequent_pair(count_dict):
     ), max_count
 
 
-def merge_optimised(token_dict, merge_pair, new_idx, byte_count, vocab):
+def get_new_key(old_key, merge_pair):
+    i = 0
+    n = len(old_key)
+    ind1, ind2 = merge_pair
+    new_pair = merge_pair[0] + merge_pair[1]
+    new_key = []
+    while i < n:
+        if i < n - 1 and old_key[i] == ind1 and old_key[i+1] == ind2:
+            new_key.append(new_pair)
+            i += 2
+        else:
+            new_key.append(old_key[i])
+            i += 1
+    assert len(new_key) > 0
+    return tuple(new_key)
+
+
+def merge_optimised(token_dict, merge_pair, byte_count, byte_pair_to_token):
     keys_to_delete = []
     update_dict = defaultdict(int)
     ind1, ind2 = merge_pair
     new_pair = merge_pair[0] + merge_pair[1]
-    for key, cnt in token_dict.items():
-        modified = False
-        i = 0
-        n = len(key)
-        new_key = []
-        while i < n:
-            if i < n - 1 and key[i] == ind1 and key[i+1] == ind2:
-                new_key.append(new_pair)
-                left_neigh = key[i - 1] if i > 0 else None
-                right_neigh = key[i + 2] if i < n - 2 else None
-                byte_count[(ind1, ind2)] -= cnt
-                if left_neigh is not None:
-                    byte_count[(left_neigh, key[i])] -= cnt
-                    byte_count[(left_neigh, new_pair)] += cnt
-                if right_neigh is not None:
-                    byte_count[(key[i+1], right_neigh)] -= cnt
-                    byte_count[(new_pair, right_neigh)] += cnt
-                i += 2
-                modified = True
-            else:
-                new_key.append(key[i])
-                i += 1
-
-        if modified:
-           update_dict[tuple(new_key)] += cnt
-           keys_to_delete.append(key)
-
-    for k in keys_to_delete:
-        token_dict.pop(k, None)
-
-    for key, val in update_dict.items():
-        token_dict[key] = token_dict.get(key, 0) + val
-
+    keys_to_change = byte_pair_to_token[(ind1, ind2)].copy()
+    for old_key in keys_to_change:
+        cnt = token_dict.pop(old_key)
+        new_key = get_new_key(old_key, merge_pair)
+        token_dict[new_key] += cnt
+        for i in range(len(old_key) - 1):
+            left, right = old_key[i], old_key[i+1]
+            byte_count[(left, right)] -= cnt
+            byte_pair_to_token[(left, right)].discard(old_key)
+        for i in range(len(new_key) - 1):
+            left, right = new_key[i], new_key[i+1]
+            byte_count[(left, right)] += cnt
+            byte_pair_to_token[(left, right)].add(new_key)
+    byte_pair_to_token[(ind1, ind2)] = set()
     byte_count.pop(merge_pair, None)
 
 
@@ -152,7 +152,7 @@ def get_token_counts(input_path, num_processes, special_tokens):
         pool.close()
         pool.join()
 
-        token_dict = {}
+        token_dict = defaultdict(int)
         for chunked_count in chunked_count_arr:
             chunked_count = chunked_count.get()
             for key, value in chunked_count.items():
@@ -196,7 +196,9 @@ def train_bpe(
     new_idx = len(vocab)
 
     with timer("Initial Byte Pair Count"):
-        byte_pair_count_dict = create_byte_pair_count(token_dict)
+        byte_pair_count_dict, byte_pair_to_token = create_byte_pair_count(token_dict)
+
+
 
     num_merges = vocab_size - len(vocab)
 
@@ -207,7 +209,7 @@ def train_bpe(
         merges.append((most_frequent_pair[0], most_frequent_pair[1]))
         vocab[new_idx] = most_frequent_pair[0] + most_frequent_pair[1]
 
-        merge_optimised(token_dict, most_frequent_pair, new_idx, byte_pair_count_dict, vocab)
+        merge_optimised(token_dict, most_frequent_pair, byte_pair_count_dict, byte_pair_to_token)
 
         new_idx += 1
 
