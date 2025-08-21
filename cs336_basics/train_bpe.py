@@ -230,4 +230,4 @@ def train_bpe_tinystories(split="validation"):
         raise ValueError(f"Invalid split: {split}")
 
 if __name__ == "__main__":
-    train_bpe("../tests/fixtures/openwebtext.txt", vocab_size=10000, special_tokens=['<|endoftext|>'])
+    train_bpe("../tests/fixtures/openwebtext.txt", vocab_size=32000, special_tokens=['<|endoftext|>'])
