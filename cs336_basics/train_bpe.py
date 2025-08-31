@@ -18,6 +18,80 @@ def timer(name="Block"):
     end = time.perf_counter()
     print(f"{name} took {end - start:.4f} seconds")
 
+class Tokenizer:
+    def __init__(self, vocab, merges, special_tokens):
+        """
+        Tokenizer class for encoding and decoding
+        Args:
+            vocab: Dict[int, tuple(bytes)]
+            merges: List[(tuple(bytes), tuple(bytes))]
+            special_tokens: str
+        """
+        self.rev_vocab = {v:k for k, v in vocab.items()}
+        self.vocab = vocab
+        self.merges = merges
+        special_tokens = sorted(special_tokens, key=lambda x: -len(x)) if special_tokens else special_tokens
+        self.special_tok_pat = re.compile( "(" + "|".join([re.escape(tok) for tok in special_tokens]) + ")") if special_tokens else None
+        self.special_tok_set = set([tok.encode("utf-8") for tok in special_tokens]) if special_tokens else set()
+        # We have to keep track of which merges appear first, therefore we maintain the order.
+        self.rank = {pair: i for i, pair in enumerate(self.merges)}
+
+    def _find_best_pair(self, pre_token):
+        best_pair = None
+        for i in range(len(pre_token) - 1):
+            a, b = pre_token[i], pre_token[i+1]
+            if (a, b) in self.rank:
+                if best_pair is None:
+                    best_pair = (self.rank[(a, b)], a, b)
+                elif self.rank[(a, b)] < best_pair[0]:
+                    best_pair = (self.rank[(a, b)], a, b)
+        if best_pair:
+            # dont return rank
+            return best_pair[1], best_pair[2]
+        return None
+
+    def encode_with_pairs(self, pre_token):
+        while True:
+            best_pair = self._find_best_pair(pre_token)
+            if best_pair is None:
+                return pre_token
+            a, b = best_pair
+            pre_token = get_new_key(pre_token, best_pair)
+        return pre_token
+
+    def encode(self, s):
+        # split `s` into pretokens
+        list_s: List[str] = self.special_tok_pat.split(s) if self.special_tok_pat else [s]
+        # split based on the pattern
+        pre_tokens: List[str] = []
+        for ss in list_s:
+            if ss.encode("utf-8") in self.special_tok_set:
+                pre_tokens.append(ss.encode("utf-8"))
+            else:
+                for m in PAT.finditer(ss):
+                    w = tuple([bytes([b]) for b in m.group().encode("utf-8")])
+                    pre_tokens.append(w)
+
+        token_ids = []
+        for pre_token in pre_tokens:
+            if pre_token in self.special_tok_set:
+                token_ids.extend([self.rev_vocab[pre_token]])
+            else:
+                new_key = pre_token
+                # for merge_pair in self.merges:
+                #     new_key = get_new_key(new_key, merge_pair)
+                new_key = self.encode_with_pairs(new_key)
+
+                token_ids.extend([self.rev_vocab[t] for t in new_key])
+
+        return token_ids
+
+    def decode(self, token_ids):
+        return b"".join([self.vocab[x] for x in token_ids]).decode("utf-8", errors="ignore")
+
+    def encode_iterable(self, f):
+        for line in f:
+            yield from self.encode(line)
 
 
 def find_chunk_boundaries(
@@ -68,6 +142,7 @@ def find_chunk_boundaries(
     # Make sure all boundaries are unique, but might be fewer than desired_num_chunks
     return sorted(set(chunk_boundaries))
 
+
 def initialize_count_dict(chunk, special_token_pattern):
     counts = defaultdict(int)
     sub_chunks = special_token_pattern.split(chunk) if special_token_pattern else [chunk]
@@ -78,6 +153,7 @@ def initialize_count_dict(chunk, special_token_pattern):
             counts[byte_arr] += 1
     return counts
 
+
 def create_byte_pair_count(count_dict):
     byte_pair_count_dict = defaultdict(int)
     byte_pair_to_token = defaultdict(set)
@@ -87,14 +163,13 @@ def create_byte_pair_count(count_dict):
             byte_pair_to_token[(ind1, ind2)].add(key)
     return byte_pair_count_dict, byte_pair_to_token
 
+
 def get_most_frequent_pair(count_dict):
     max_count = max(count_dict.values())
-    max_val = [k for k, v in count_dict.items() if v == max_count]
-
     return max(
         (k for k, v in count_dict.items() if v == max_count),
         key=lambda x: x  # lexicographically larger wins on tie
-    ), max_count
+    )
 
 
 def get_new_key(old_key, merge_pair):
@@ -115,6 +190,17 @@ def get_new_key(old_key, merge_pair):
 
 
 def merge_optimised(token_dict, merge_pair, byte_count, byte_pair_to_token):
+    """ This procedure updates `token_dict` by adding the inserting the merge_pair.
+    This also updates byte_count and byte_pair_to_token with the new counts and tokens
+    after the merge.
+
+    Args:
+        token_dict: A dictionary with pre-tokens as keys and counts as values.
+        merge_pair: Pair of tokens that has to be merged
+        byte_count: A dictionary mapping byte-pairs to their counts
+        byte_pair_to_token: A dictionary mapping byte-pairs to a list of pre-tokens that contain
+                    the byte-pair
+    """
     keys_to_delete = []
     update_dict = defaultdict(int)
     ind1, ind2 = merge_pair
@@ -136,7 +222,7 @@ def merge_optimised(token_dict, merge_pair, byte_count, byte_pair_to_token):
     byte_count.pop(merge_pair, None)
 
 
-def get_token_counts(input_path, num_processes, special_tokens):
+def pre_tokenize(input_path, num_processes, special_tokens):
     with open(input_path, "rb") as f:
         boundaries = find_chunk_boundaries(f, num_processes,
                                            b"<|endoftext|>")
@@ -159,6 +245,7 @@ def get_token_counts(input_path, num_processes, special_tokens):
                 token_dict[key] = token_dict.get(key, 0) + value
 
         return token_dict
+
 
 def train_bpe(
     input_path: str | os.PathLike,
@@ -191,20 +278,18 @@ def train_bpe(
     vocab = {i: tok for i, tok in enumerate(initial_tokens)}
     merges = []
     with timer("Pre tokenisation"):
-        token_dict = get_token_counts(input_path, os.cpu_count() // 2, special_tokens)
+        token_dict = pre_tokenize(input_path, os.cpu_count() // 2, special_tokens)
 
     new_idx = len(vocab)
 
     with timer("Initial Byte Pair Count"):
         byte_pair_count_dict, byte_pair_to_token = create_byte_pair_count(token_dict)
 
-
-
     num_merges = vocab_size - len(vocab)
 
     for _ in tqdm(range(num_merges)):
 
-        most_frequent_pair, cnt = get_most_frequent_pair(byte_pair_count_dict)
+        most_frequent_pair = get_most_frequent_pair(byte_pair_count_dict)
 
         merges.append((most_frequent_pair[0], most_frequent_pair[1]))
         vocab[new_idx] = most_frequent_pair[0] + most_frequent_pair[1]
@@ -221,6 +306,7 @@ def train_bpe(
             pickle.dump(merges, f)
     return (vocab, merges)
 
+
 def train_bpe_tinystories(split="validation"):
     if split == "validation":
         train_bpe("../tests/fixtures/tinystories_validation.txt", vocab_size=10000, special_tokens=['<|endoftext|>'])
@@ -228,6 +314,7 @@ def train_bpe_tinystories(split="validation"):
         train_bpe("../tests/fixtures/tinystories_train.txt", vocab_size=10000, special_tokens=['<|endoftext|>'])
     else:
         raise ValueError(f"Invalid split: {split}")
+
 
 if __name__ == "__main__":
     train_bpe("../tests/fixtures/openwebtext.txt", vocab_size=32000, special_tokens=['<|endoftext|>'])
