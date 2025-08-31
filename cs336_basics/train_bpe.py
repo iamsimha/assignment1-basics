@@ -315,29 +315,83 @@ def train_bpe_tinystories(split="validation"):
     else:
         raise ValueError(f"Invalid split: {split}")
 
-def get_compression_ratio(tokenizer, list_s):
+
+def get_tokenization_stats(tokenizer, list_s):
+    """
+    Returns average tokenizer compression ratio and tokenizer throughput.
+
+    Args:
+        tokenizer: Tokenizer to be tested (must have .encode(str) -> List[int]).
+        list_s: List of strings over which stats are averaged.
+
+    Returns:
+        compression_ratio (bytes/token), throughput (tokens/sec).
+    """
+    total_bytes = 0
+    total_tokens = 0
+    total_time = 0.0
+
+    for s in list_s:
+        b = s.encode("utf-8")
+        start = time.perf_counter()
+        token_ids = tokenizer.encode(s)
+        end = time.perf_counter()
+
+        if not token_ids:   # avoid division by zero
+            continue
+
+        total_bytes += len(b)
+        total_tokens += len(token_ids)
+        total_time += (end - start)
+
+    compression_ratio = total_bytes / total_tokens if total_tokens else 0
+    throughput = total_tokens / total_time if total_time else 0
+
+    return compression_ratio, throughput
+
+
+def get_tokenzation_stats1(tokenizer, list_s):
+    """This function return average tokenizer compression ratio and tokenizer throughput
+    Args:
+        tokenizer: Tokenizer to be tested
+        list_s: List of strings over which this stats are averaged.
+    Returns:
+        compression ratio(bytes/token) and tokenizer throughput(tokens/second)
+    """
     compression_ratio = []
     for s in list_s:
         # compression ratio = #bytes/#tokens
-        compression_ratio.append(len(s.encode("utf-8"))/len(tokenizer.encode(s)))
-    return sum(compression_ratio) / len(compression_ratio)
+        token_ids = tokenizer.encode(s)
+        elapsed_time = end - start
+        compression_ratio.append(len(s.encode("utf-8"))/len(token_ids))
+        tokenizer_throughput.append(len(token_ids)/elapsed_time)
+    return sum(compression_ratio) / len(compression_ratio), sum(tokenizer_throughput) / len(tokenizer_throughput)
 
-def measure_compression_ratio(doc_path, vocab_path, num_documents):
-    with open(os.path.join(vocab_path, "merges.pkl"), "rb") as f:
-        merges = pickle.load(f)
-    with open(os.path.join(vocab_path, "vocab.pkl"), "rb") as f:
-        vocab = pickle.load(f)
-    tokenizer = Tokenizer(vocab, merges, ["<|endoftext|>"])
+def load_dataset_sample(doc_path, num_documents, delimiter):
     docs = []
     with open(doc_path) as f:
         doc = ""
         for line in f:
             doc += line
-            if "<|endoftext|>" in line:
+            if delimiter in line:
                 docs.append(doc)
                 if len(docs) >= num_documents:
                     break
-    print(f"Compression ratio = {get_compression_ratio(tokenizer, docs)}")
+    return docs
+
+def load_tokenizer(vocab_path):
+    with open(os.path.join(vocab_path, "merges.pkl"), "rb") as f:
+        merges = pickle.load(f)
+    with open(os.path.join(vocab_path, "vocab.pkl"), "rb") as f:
+        vocab = pickle.load(f)
+    return Tokenizer(vocab, merges, ["<|endoftext|>"])
+
+def measure_compression_ratio(doc_path, vocab_path, num_documents):
+    tokenizer = load_tokenizer(vocab_path)
+    docs = load_dataset_sample(doc_path, num_documents, "<|endoftext|>")
+    comp_ratio, tok_throughput = get_tokenization_stats(tokenizer, docs)
+    print(f"Compression ratio = {comp_ratio:0.2f}, Tokenizaton throughput = {tok_throughput:0.2f}")
+
 
 
 if __name__ == "__main__":
