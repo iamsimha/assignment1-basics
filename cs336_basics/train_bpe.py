@@ -315,6 +315,33 @@ def train_bpe_tinystories(split="validation"):
     else:
         raise ValueError(f"Invalid split: {split}")
 
+def get_compression_ratio(tokenizer, list_s):
+    compression_ratio = []
+    for s in list_s:
+        # compression ratio = #bytes/#tokens
+        compression_ratio.append(len(s.encode("utf-8"))/len(tokenizer.encode(s)))
+    return sum(compression_ratio) / len(compression_ratio)
+
+def measure_compression_ratio(doc_path, vocab_path, num_documents):
+    with open(os.path.join(vocab_path, "merges.pkl"), "rb") as f:
+        merges = pickle.load(f)
+    with open(os.path.join(vocab_path, "vocab.pkl"), "rb") as f:
+        vocab = pickle.load(f)
+    tokenizer = Tokenizer(vocab, merges, ["<|endoftext|>"])
+    docs = []
+    with open(doc_path) as f:
+        doc = ""
+        for line in f:
+            doc += line
+            if "<|endoftext|>" in line:
+                docs.append(doc)
+                if len(docs) >= num_documents:
+                    break
+    print(f"Compression ratio = {get_compression_ratio(tokenizer, docs)}")
+
 
 if __name__ == "__main__":
-    train_bpe("../tests/fixtures/openwebtext.txt", vocab_size=32000, special_tokens=['<|endoftext|>'])
+    measure_compression_ratio("../tests/fixtures/tinystories_train.txt",
+        "../tests/fixtures/tokenizers/tinystories/", 10)
+
+    # train_bpe("../tests/fixtures/openwebtext.txt", vocab_size=32000, special_tokens=['<|endoftext|>'])
