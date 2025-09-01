@@ -3,16 +3,27 @@ import regex as re
 import pickle
 import os
 import time
+from itertools import tee
 from typing import IO, Any, BinaryIO
 from collections import defaultdict
 from multiprocessing import Pool
 from tqdm.auto import tqdm
 from contextlib import contextmanager
+from functools import lru_cache
+from concurrent.futures import ProcessPoolExecutor
 
 PAT = re.compile(r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+""")
 
 @contextmanager
 def timer(name="Block"):
+    """Context manager for timing code blocks.
+
+    Args:
+        name (str): Name of the block being timed. Defaults to "Block".
+
+    Yields:
+        None: Context manager yields control to the with block.
+    """
     start = time.perf_counter()
     yield
     end = time.perf_counter()
@@ -37,6 +48,14 @@ class Tokenizer:
         self.rank = {pair: i for i, pair in enumerate(self.merges)}
 
     def _find_best_pair(self, pre_token):
+        """Find the best pair to merge in a pre-token based on merge rankings.
+
+        Args:
+            pre_token (tuple): Tuple of bytes representing a pre-token.
+
+        Returns:
+            tuple or None: The best pair (a, b) to merge, or None if no valid pair found.
+        """
         best_pair = None
         for i in range(len(pre_token) - 1):
             a, b = pre_token[i], pre_token[i+1]
@@ -50,7 +69,16 @@ class Tokenizer:
             return best_pair[1], best_pair[2]
         return None
 
-    def encode_with_pairs(self, pre_token):
+    @lru_cache(maxsize=100000)
+    def apply_merges(self, pre_token):
+        """Apply BPE merges to a pre-token until no more merges are possible.
+
+        Args:
+            pre_token (tuple): Tuple of bytes representing a pre-token.
+
+        Returns:
+            tuple: The pre-token after all applicable merges have been applied.
+        """
         while True:
             best_pair = self._find_best_pair(pre_token)
             if best_pair is None:
@@ -60,6 +88,14 @@ class Tokenizer:
         return pre_token
 
     def encode(self, s):
+        """Encode a string into a list of token IDs using BPE.
+
+        Args:
+            s (str): Input string to encode.
+
+        Returns:
+            list[int]: List of token IDs representing the encoded string.
+        """
         # split `s` into pretokens
         list_s: List[str] = self.special_tok_pat.split(s) if self.special_tok_pat else [s]
         # split based on the pattern
@@ -71,27 +107,48 @@ class Tokenizer:
                 for m in PAT.finditer(ss):
                     w = tuple([bytes([b]) for b in m.group().encode("utf-8")])
                     pre_tokens.append(w)
-
         token_ids = []
         for pre_token in pre_tokens:
             if pre_token in self.special_tok_set:
                 token_ids.extend([self.rev_vocab[pre_token]])
             else:
-                new_key = pre_token
-                # for merge_pair in self.merges:
-                #     new_key = get_new_key(new_key, merge_pair)
-                new_key = self.encode_with_pairs(new_key)
-
-                token_ids.extend([self.rev_vocab[t] for t in new_key])
-
+                pre_token = self.apply_merges(pre_token)
+                token_ids.extend([self.rev_vocab[t] for t in pre_token])
         return token_ids
 
     def decode(self, token_ids):
+        """Decode a list of token IDs back into a string.
+
+        Args:
+            token_ids (list[int]): List of token IDs to decode.
+
+        Returns:
+            str: Decoded string from the token IDs.
+        """
         return b"".join([self.vocab[x] for x in token_ids]).decode("utf-8", errors="ignore")
 
-    def encode_iterable(self, f):
+    def encode_iterable(self, f, block_size=64):
+        """Encode an iterable of strings using parallel processing.
+
+        Args:
+            f (Iterable[str]): Iterable of strings to encode.
+            block_size (int): Number of lines to process in each batch. Defaults to 64.
+
+        Yields:
+            int: Token IDs from encoding the input strings.
+        """
+        lines = []
         for line in f:
-            yield from self.encode(line)
+            lines.append(line)
+            if len(lines) >= block_size:
+                # process lines
+                with ProcessPoolExecutor(max_workers=10) as ex:
+                    for result in ex.map(self.encode, lines):   # preserves order
+                        yield from result
+                lines = []
+        if lines: # if #lines is not a multiple of block size
+            for line in lines:
+                yield from self.encode(line)
 
 
 def find_chunk_boundaries(
@@ -144,6 +201,15 @@ def find_chunk_boundaries(
 
 
 def initialize_count_dict(chunk, special_token_pattern):
+    """Initialize a count dictionary from a text chunk.
+
+    Args:
+        chunk (str): Text chunk to process.
+        special_token_pattern (re.Pattern or None): Regex pattern for special tokens.
+
+    Returns:
+        defaultdict[tuple, int]: Dictionary mapping byte tuples to their counts.
+    """
     counts = defaultdict(int)
     sub_chunks = special_token_pattern.split(chunk) if special_token_pattern else [chunk]
     for sub_chunk in sub_chunks:
@@ -155,6 +221,16 @@ def initialize_count_dict(chunk, special_token_pattern):
 
 
 def create_byte_pair_count(count_dict):
+    """Create byte pair counts and mappings from token counts.
+
+    Args:
+        count_dict (dict): Dictionary mapping tokens to their counts.
+
+    Returns:
+        tuple[defaultdict, defaultdict]: Tuple containing:
+            - byte_pair_count_dict: Maps byte pairs to their total counts
+            - byte_pair_to_token: Maps byte pairs to sets of tokens containing them
+    """
     byte_pair_count_dict = defaultdict(int)
     byte_pair_to_token = defaultdict(set)
     for key, cnt in count_dict.items():
@@ -165,6 +241,14 @@ def create_byte_pair_count(count_dict):
 
 
 def get_most_frequent_pair(count_dict):
+    """Get the most frequent byte pair from a count dictionary.
+
+    Args:
+        count_dict (dict): Dictionary mapping byte pairs to their counts.
+
+    Returns:
+        tuple: The most frequent byte pair. In case of ties, returns lexicographically largest.
+    """
     max_count = max(count_dict.values())
     return max(
         (k for k, v in count_dict.items() if v == max_count),
@@ -173,6 +257,15 @@ def get_most_frequent_pair(count_dict):
 
 
 def get_new_key(old_key, merge_pair):
+    """Apply a merge operation to a token key.
+
+    Args:
+        old_key (tuple): Original token as a tuple of bytes.
+        merge_pair (tuple): Pair of bytes to merge (ind1, ind2).
+
+    Returns:
+        tuple: New token key with the merge pair replaced by merged bytes.
+    """
     i = 0
     n = len(old_key)
     ind1, ind2 = merge_pair
@@ -190,16 +283,18 @@ def get_new_key(old_key, merge_pair):
 
 
 def merge_optimised(token_dict, merge_pair, byte_count, byte_pair_to_token):
-    """ This procedure updates `token_dict` by adding the inserting the merge_pair.
+    """Update token dictionary by applying a merge operation.
+
+    This procedure updates `token_dict` by inserting the merge_pair.
     This also updates byte_count and byte_pair_to_token with the new counts and tokens
     after the merge.
 
     Args:
-        token_dict: A dictionary with pre-tokens as keys and counts as values.
-        merge_pair: Pair of tokens that has to be merged
-        byte_count: A dictionary mapping byte-pairs to their counts
-        byte_pair_to_token: A dictionary mapping byte-pairs to a list of pre-tokens that contain
-                    the byte-pair
+        token_dict (dict): A dictionary with pre-tokens as keys and counts as values.
+        merge_pair (tuple): Pair of tokens that has to be merged.
+        byte_count (dict): A dictionary mapping byte-pairs to their counts.
+        byte_pair_to_token (dict): A dictionary mapping byte-pairs to a list of pre-tokens that contain
+                    the byte-pair.
     """
     keys_to_delete = []
     update_dict = defaultdict(int)
@@ -223,6 +318,16 @@ def merge_optimised(token_dict, merge_pair, byte_count, byte_pair_to_token):
 
 
 def pre_tokenize(input_path, num_processes, special_tokens):
+    """Pre-tokenize input file using multiprocessing.
+
+    Args:
+        input_path (str): Path to the input file to tokenize.
+        num_processes (int): Number of processes to use for parallel processing.
+        special_tokens (list[str]): List of special tokens to handle separately.
+
+    Returns:
+        defaultdict[tuple, int]: Dictionary mapping token tuples to their counts.
+    """
     with open(input_path, "rb") as f:
         boundaries = find_chunk_boundaries(f, num_processes,
                                            b"<|endoftext|>")
@@ -308,6 +413,14 @@ def train_bpe(
 
 
 def train_bpe_tinystories(split="validation"):
+    """Train BPE tokenizer on TinyStories dataset.
+
+    Args:
+        split (str): Dataset split to use, either "validation" or "train". Defaults to "validation".
+
+    Raises:
+        ValueError: If split is not "validation" or "train".
+    """
     if split == "validation":
         train_bpe("../tests/fixtures/tinystories_validation.txt", vocab_size=10000, special_tokens=['<|endoftext|>'])
     elif split == "train":
@@ -315,59 +428,50 @@ def train_bpe_tinystories(split="validation"):
     else:
         raise ValueError(f"Invalid split: {split}")
 
-
-def get_tokenization_stats(tokenizer, list_s):
+def get_tokenization_stats_iterable(tokenizer, iterable, block_size: int = 64):
     """
-    Returns average tokenizer compression ratio and tokenizer throughput.
+    Measure compression ratio and throughput using tokenizer.encode_iterable(iterable).
 
     Args:
-        tokenizer: Tokenizer to be tested (must have .encode(str) -> List[int]).
-        list_s: List of strings over which stats are averaged.
+        tokenizer: has .encode_iterable(iterable, block_size) -> yields token ids (ints) one by one
+        iterable: any Iterable[str] (e.g., open(file), list of lines, generator of strings)
+        block_size: passed through to encode_iterable
 
     Returns:
-        compression_ratio (bytes/token), throughput (tokens/sec).
+        (compression_ratio_bytes_per_token, throughput_tokens_per_sec)
     """
+    # We need to know total input bytes AND total tokens produced.
+    # Use tee() so we can 1) sum bytes and 2) drive encode_iterable without re-reading the source.
+    it_for_bytes, it_for_tokens = tee(iterable)
+
+    # Total UTF-8 bytes in the input
     total_bytes = 0
+    for s in it_for_bytes:
+        total_bytes += len(s.encode("utf-8"))
+
+    # Consume the streaming encoder and count tokens
     total_tokens = 0
-    total_time = 0.0
+    t0 = time.perf_counter()
+    for _tok in tokenizer.encode_iterable(it_for_tokens, block_size=block_size):
+        total_tokens += 1
+    t1 = time.perf_counter()
 
-    for s in list_s:
-        b = s.encode("utf-8")
-        start = time.perf_counter()
-        token_ids = tokenizer.encode(s)
-        end = time.perf_counter()
-
-        if not token_ids:   # avoid division by zero
-            continue
-
-        total_bytes += len(b)
-        total_tokens += len(token_ids)
-        total_time += (end - start)
-
-    compression_ratio = total_bytes / total_tokens if total_tokens else 0
-    throughput = total_tokens / total_time if total_time else 0
-
+    compression_ratio = (total_bytes / total_tokens) if total_tokens else 0.0
+    throughput = (total_tokens / (t1 - t0)) if (t1 > t0) else 0.0
     return compression_ratio, throughput
 
 
-def get_tokenzation_stats1(tokenizer, list_s):
-    """This function return average tokenizer compression ratio and tokenizer throughput
-    Args:
-        tokenizer: Tokenizer to be tested
-        list_s: List of strings over which this stats are averaged.
-    Returns:
-        compression ratio(bytes/token) and tokenizer throughput(tokens/second)
-    """
-    compression_ratio = []
-    for s in list_s:
-        # compression ratio = #bytes/#tokens
-        token_ids = tokenizer.encode(s)
-        elapsed_time = end - start
-        compression_ratio.append(len(s.encode("utf-8"))/len(token_ids))
-        tokenizer_throughput.append(len(token_ids)/elapsed_time)
-    return sum(compression_ratio) / len(compression_ratio), sum(tokenizer_throughput) / len(tokenizer_throughput)
-
 def load_dataset_sample(doc_path, num_documents, delimiter):
+    """Load a sample of documents from a dataset file.
+
+    Args:
+        doc_path (str): Path to the dataset file.
+        num_documents (int): Maximum number of documents to load.
+        delimiter (str): String delimiter that separates documents.
+
+    Returns:
+        list[str]: List of document strings.
+    """
     docs = []
     with open(doc_path) as f:
         doc = ""
@@ -380,6 +484,14 @@ def load_dataset_sample(doc_path, num_documents, delimiter):
     return docs
 
 def load_tokenizer(vocab_path):
+    """Load a trained tokenizer from saved vocabulary and merges files.
+
+    Args:
+        vocab_path (str): Path to directory containing vocab.pkl and merges.pkl files.
+
+    Returns:
+        Tokenizer: Loaded tokenizer instance with special token "<|endoftext|>".
+    """
     with open(os.path.join(vocab_path, "merges.pkl"), "rb") as f:
         merges = pickle.load(f)
     with open(os.path.join(vocab_path, "vocab.pkl"), "rb") as f:
@@ -387,15 +499,22 @@ def load_tokenizer(vocab_path):
     return Tokenizer(vocab, merges, ["<|endoftext|>"])
 
 def measure_compression_ratio(doc_path, vocab_path, num_documents):
+    """Measure compression ratio and tokenization throughput for a dataset.
+
+    Args:
+        doc_path (str): Path to the dataset file.
+        vocab_path (str): Path to directory containing tokenizer files.
+        num_documents (int): Number of documents to process for measurement.
+    """
     tokenizer = load_tokenizer(vocab_path)
     docs = load_dataset_sample(doc_path, num_documents, "<|endoftext|>")
-    comp_ratio, tok_throughput = get_tokenization_stats(tokenizer, docs)
+    comp_ratio, tok_throughput = get_tokenization_stats_iterable(tokenizer, docs)
     print(f"Compression ratio = {comp_ratio:0.2f}, Tokenizaton throughput = {tok_throughput:0.2f}")
 
 
 
 if __name__ == "__main__":
     measure_compression_ratio("../tests/fixtures/tinystories_train.txt",
-        "../tests/fixtures/tokenizers/tinystories/", 10)
+        "../tests/fixtures/tokenizers/tinystories/", 256)
 
     # train_bpe("../tests/fixtures/openwebtext.txt", vocab_size=32000, special_tokens=['<|endoftext|>'])
