@@ -3,11 +3,16 @@ import regex as re
 import pickle
 import os
 import time
+import numpy as np
+import sys
+from itertools import tee, islice
 from typing import IO, Any, BinaryIO
 from collections import defaultdict
 from multiprocessing import Pool
 from tqdm.auto import tqdm
 from contextlib import contextmanager
+from functools import lru_cache
+from concurrent.futures import ProcessPoolExecutor
 
 PAT = re.compile(r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+""")
 
@@ -50,7 +55,8 @@ class Tokenizer:
             return best_pair[1], best_pair[2]
         return None
 
-    def encode_with_pairs(self, pre_token):
+    @lru_cache(maxsize=100000)
+    def apply_merges(self, pre_token):
         while True:
             best_pair = self._find_best_pair(pre_token)
             if best_pair is None:
@@ -80,7 +86,7 @@ class Tokenizer:
                 new_key = pre_token
                 # for merge_pair in self.merges:
                 #     new_key = get_new_key(new_key, merge_pair)
-                new_key = self.encode_with_pairs(new_key)
+                new_key = self.apply_merges(new_key)
 
                 token_ids.extend([self.rev_vocab[t] for t in new_key])
 
@@ -90,8 +96,9 @@ class Tokenizer:
         return b"".join([self.vocab[x] for x in token_ids]).decode("utf-8", errors="ignore")
 
     def encode_iterable(self, f):
-        for line in f:
-            yield from self.encode(line)
+            for line in f:
+                yield from self.encode(line)
+
 
 
 def find_chunk_boundaries(
@@ -367,17 +374,76 @@ def get_tokenzation_stats1(tokenizer, list_s):
         tokenizer_throughput.append(len(token_ids)/elapsed_time)
     return sum(compression_ratio) / len(compression_ratio), sum(tokenizer_throughput) / len(tokenizer_throughput)
 
-def load_dataset_sample(doc_path, num_documents, delimiter):
+def get_tokenization_stats_iterable(tokenizer, iterable):
+    """
+    Measure compression ratio and throughput using tokenizer.encode_iterable(iterable).
+
+    Args:
+        tokenizer: has .encode_iterable(iterable, block_size) -> yields token ids (ints) one by one
+        iterable: any Iterable[str] (e.g., open(file), list of lines, generator of strings)
+        block_size: passed through to encode_iterable
+
+    Returns:
+        (compression_ratio_bytes_per_token, throughput_tokens_per_sec)
+    """
+    # We need to know total input bytes AND total tokens produced.
+    # Use tee() so we can 1) sum bytes and 2) drive encode_iterable without re-reading the source.
+    it_for_bytes, it_for_tokens = tee(iterable)
+
+    # Total UTF-8 bytes in the input
+    total_bytes = 0
+    for s in it_for_bytes:
+        total_bytes += len(s.encode("utf-8"))
+
+    # Consume the streaming encoder and count tokens
+    total_tokens = 0
+    t0 = time.perf_counter()
+
+    for _tok in tokenizer.encode_iterable(it_for_tokens):
+        total_tokens += 1
+    t1 = time.perf_counter()
+
+    compression_ratio = (total_bytes / total_tokens) if total_tokens else 0.0
+    throughput = (total_tokens / (t1 - t0)) if (t1 > t0) else 0.0
+    return compression_ratio, throughput
+
+def load_dataset_sample(doc_path, delimiter, num_documents):
     docs = []
+    d_l = len(delimiter)
     with open(doc_path) as f:
         doc = ""
         for line in f:
             doc += line
-            if delimiter in line:
-                docs.append(doc)
-                if len(docs) >= num_documents:
+            while True:
+                ind = doc.find(delimiter)
+                if ind == -1:
                     break
+                end = ind + d_l
+                docs.append(doc[:end])
+                if len(docs) >= num_documents:
+                    return docs
+                doc = doc[end:]
     return docs
+
+def load_dataset_stream(doc_path, delimiter, num_documents):
+    docs = []
+    d_l = len(delimiter)
+    with open(doc_path) as f:
+        doc = ""
+        for line in f:
+            doc += line
+            while True:
+                ind = doc.find(delimiter)
+                if ind == -1:
+                    break
+                end = ind + d_l
+                docs.append(doc[:end])
+                if len(docs) >= num_documents:
+                    yield docs
+                    docs = []
+                doc = doc[end:]
+    if docs:
+        yield docs
 
 def load_tokenizer(vocab_path):
     with open(os.path.join(vocab_path, "merges.pkl"), "rb") as f:
@@ -388,14 +454,42 @@ def load_tokenizer(vocab_path):
 
 def measure_compression_ratio(doc_path, vocab_path, num_documents):
     tokenizer = load_tokenizer(vocab_path)
-    docs = load_dataset_sample(doc_path, num_documents, "<|endoftext|>")
-    comp_ratio, tok_throughput = get_tokenization_stats(tokenizer, docs)
+    docs = load_dataset_sample(doc_path, "<|endoftext|>", num_documents,)
+    comp_ratio, tok_throughput = get_tokenization_stats_iterable(tokenizer, docs)
     print(f"Compression ratio = {comp_ratio:0.2f}, Tokenizaton throughput = {tok_throughput:0.2f}")
+
+
+def tokenize_corpus(corpus_path, vocab_path, output_path, num_documents=1000):
+    tokenizer = load_tokenizer(vocab_path)
+    data_stream = load_dataset_stream(corpus_path, "<|endoftext|>", num_documents)
+    start = time.perf_counter()
+    total = 0
+    with open(output_path, "wb") as fout:
+        for docs in data_stream:
+            tokens = list(tokenizer.encode_iterable(docs))
+            total += len(tokens)
+            arr = np.asarray(tokens, dtype=np.uint16)
+            arr.tofile(fout)
+            elapsed = time.perf_counter() - start
+
+            print(f"Tokenization throughput = {total/elapsed}")
 
 
 
 if __name__ == "__main__":
-    measure_compression_ratio("../tests/fixtures/tinystories_train.txt",
-        "../tests/fixtures/tokenizers/tinystories/", 10)
+    # tokenize_corpus("../tests/fixtures/tinystories_sample.txt",
+    #                 "../tests/fixtures/tokenizers/tinystories",
+    #                 "../data/tokenized/tinystories_sample.bin")
+    # tokenize_corpus("../tests/fixtures/tinystories_sample_5M.txt",
+    #                 "../tests/fixtures/tokenizers/tinystories",
+    #                 "../data/tokenized/tinystories_sample_5M.bin")
+    tokenize_corpus("../tests/fixtures/tinystories_train.txt",
+                    "../tests/fixtures/tokenizers/tinystories",
+                    "../data/tokenized/tinystories_train.bin")
+    # tokenize_corpus("../tests/fixtures/openwebtext.txt",
+    #                 "../tests/fixtures/tokenizers/openwebtext",
+    #                 "../data/tokenized/openwebtext.bin")
+    # measure_compression_ratio("../tests/fixtures/openwebtext.txt",
+    #     "../tests/fixtures/tokenizers/openwebtext/", 1000)
 
     # train_bpe("../tests/fixtures/openwebtext.txt", vocab_size=32000, special_tokens=['<|endoftext|>'])
