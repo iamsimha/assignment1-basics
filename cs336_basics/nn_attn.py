@@ -33,6 +33,7 @@ class MultiHeadSelfAttn(nn.Module):
         dtype: Optional[torch.dtype] = None,
     ) -> None:
         super(MultiHeadSelfAttn, self).__init__()
+        self.device = device
         self.d_model = d_model
         self.num_heads = num_heads
         self.use_rope = use_rope
@@ -43,7 +44,7 @@ class MultiHeadSelfAttn(nn.Module):
         self.output_proj = Linear(d_model, d_model, device=device, dtype=dtype)
         if use_rope:
             self.theta = theta
-            self.rope = Rope(d_model // num_heads, theta, max_seq_len)
+            self.rope = Rope(d_model // num_heads, theta, max_seq_len, dtype=dtype, device=device)
 
 
     def forward(
@@ -58,7 +59,7 @@ class MultiHeadSelfAttn(nn.Module):
         q = rearrange(q, "... sequence_length (h d_k) -> ... h sequence_length d_k", h=self.num_heads)
         k = rearrange(k, "... sequence_length (h d_k) -> ... h sequence_length d_k", h=self.num_heads)
         v = rearrange(v, "... sequence_length (h d_v) -> ... h sequence_length d_v", h=self.num_heads)
-        mask = (1 - torch.triu(torch.ones((seq_length, seq_length)), diagonal=1)).to(torch.bool)
+        mask = (1 - torch.triu(torch.ones((seq_length, seq_length), device=self.device), diagonal=1)).to(torch.bool)
         if self.use_rope:
             q = self.rope(q, torch.arange(seq_length))
             k = self.rope(k, torch.arange(seq_length))        

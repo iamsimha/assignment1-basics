@@ -22,24 +22,34 @@ class TransformerBlock(nn.Module):
         theta: float,
         device: Optional[torch.device] = None,
         dtype: Optional[torch.dtype] = None,
+        pre_norm=True,
+        use_rope=True
     ) -> None:
         super(TransformerBlock, self).__init__()
         self.attn = MultiHeadSelfAttn(d_model, num_heads,
-                                use_rope=True, theta=theta,
+                                use_rope=use_rope, theta=theta,
                                 max_seq_len=max_seq_len,
                                 device=device, dtype=dtype)
         self.ffn = SwiGlu(d_model, d_ff, device=device, dtype=dtype)
         self.ln1 = RMSNorm(d_model, device=device, dtype=dtype)
         self.ln2 = RMSNorm(d_model, device=device, dtype=dtype)
+        self.pre_norm = pre_norm
     
     def forward(
         self,
         x: Float[Tensor, "... seq_len d_model"],
     ) -> Float[Tensor, "... seq_len d_model"]:
-        first_sub_layer = self.attn(self.ln1(x))
-        x = x + first_sub_layer
-        second_sub_layer = self.ffn(self.ln2(x))
-        x = x + second_sub_layer
+
+        if self.pre_norm == True:
+            first_sub_layer = self.attn(self.ln1(x))
+            x = x + first_sub_layer
+            second_sub_layer = self.ffn(self.ln2(x))
+            x = x + second_sub_layer
+        else:
+            first_sub_layer = self.attn(x)
+            x = self.ln1(x + first_sub_layer)
+            second_sub_layer = self.ffn(x)
+            x = self.ln2(x + second_sub_layer)
         return x
 
 class Transformer(nn.Module):
@@ -54,13 +64,16 @@ class Transformer(nn.Module):
         vocab_size: int,
         device: Optional[torch.device] = None,
         dtype: Optional[torch.dtype] = None,
+        pre_norm=True,
+        use_rope=True
     ) -> None:
         super(Transformer, self).__init__()
         self.token_embeddings = Embedding(vocab_size, d_model, device=device, dtype=dtype)
         self.layers = nn.ModuleList([TransformerBlock(d_model, num_heads, d_ff,
-                        max_seq_len, theta, device=device, dtype=dtype) for _ in range(num_layers)])
+                        max_seq_len, theta, device=device, dtype=dtype,
+                        pre_norm=pre_norm, use_rope=use_rope) for _ in range(num_layers)])
         self.ln_final = RMSNorm(d_model, device=device, dtype=dtype)
-        self.lm_head = Linear(d_model, vocab_size)
+        self.lm_head = Linear(d_model, vocab_size, device=device, dtype=dtype)
 
     def forward(
         self,

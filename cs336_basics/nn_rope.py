@@ -19,6 +19,8 @@ class Rope(nn.Module):
         self.theta = theta
         self.d_k = d_k
         self.max_seq_len = max_seq_len
+        self.dtype = dtype
+        self.device = device
         self.initialize_sin_cos()
 
         
@@ -27,11 +29,12 @@ class Rope(nn.Module):
         max_seq_len = self.max_seq_len
         d_k = self.d_k
         assert d_k % 2 == 0
-        den = theta ** (torch.arange(0, d_k, 2) / d_k)
-        num = torch.arange(0, max_seq_len)
+        den = theta ** (torch.arange(0, d_k, 2, dtype=self.dtype,
+                            device=self.device) / d_k)
+        num = torch.arange(0, max_seq_len, dtype=self.dtype, device=self.device)
         freqs = num.unsqueeze(1) / den
-        self.register_buffer("cos_matrix", torch.cos(freqs))
-        self.register_buffer("sin_matrix", torch.sin(freqs))
+        self.register_buffer("cos_matrix", torch.cos(freqs), persistent=True)
+        self.register_buffer("sin_matrix", torch.sin(freqs), persistent=True)
 
     def forward(
         self,

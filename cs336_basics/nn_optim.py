@@ -16,7 +16,7 @@ class SGD(Optimizer):
             raise ValueError(f"Invalid learning rate: {lr}")
         defaults = {"lr": lr}
         super().__init__(params, defaults)
-    
+
     def step(self, closure=None):
         loss = None if closure is None else closure()
         for group in self.param_groups:
@@ -24,7 +24,7 @@ class SGD(Optimizer):
             for p in group["params"]:
                 if p.grad is None:
                     continue
-                
+
                 state = self.state[p]
                 t = state.get("t", 0)
                 grad = p.grad.data
@@ -44,7 +44,7 @@ class AdamW(Optimizer):
         self.eps = eps
         self.weight_decay = weight_decay
         super().__init__(params, defaults)
-    
+
     def step(self, closure=None):
         loss = None if closure is None else closure()
         for group in self.param_groups:
@@ -60,15 +60,15 @@ class AdamW(Optimizer):
                 m = beta1 * m + (1 - beta1) * grad
                 v = beta2 * v + (1 - beta2) * grad**2
                 t = state.get("t", 1)
-                lr_t = lr * math.sqrt(1 - math.pow(beta2, t)) / (1 - math.pow(beta1, t))
-                p.data = p.data - lr_t * m / (torch.sqrt(v) + self.eps)
+                beta_ratio = math.sqrt(1 - math.pow(beta2, t)) / (1 - math.pow(beta1, t))
+                p.data = p.data - (lr * beta_ratio * m / (torch.sqrt(v) + self.eps))
                 p.data = p.data - lr * self.weight_decay * p.data
                 state["t"] = t + 1
                 state["m"] = m
                 state["v"] = v
         return loss
 
-def get_lr_schedule(it: int,
+def get_cosine_lr_schedule(it: int,
                     max_learning_rate: float,
                     min_learning_rate: float,
                     warmup_iters: int,
@@ -92,3 +92,21 @@ def clip_gradients(param_list, max_l2_norm):
                 if param.grad is None:
                     continue
                 param.grad.mul_(max_l2_norm/ (total_norm  + 1e-6))
+
+class CosineLRScheduler:
+    def __init__(self, optimizer, max_learning_rate, min_learning_rate, warmup_iters, cosine_cycle_iters):
+        self.max_learning_rate = max_learning_rate
+        self.min_learning_rate = min_learning_rate
+        self.warmup_iters = warmup_iters
+        self.cosine_cycle_iters = cosine_cycle_iters
+        self.optimizer = optimizer
+        self.it = 1
+
+    def step(self):
+        self.it += 1
+        lr = get_cosine_lr_schedule(self.it,
+                            self.max_learning_rate,
+                            self.min_learning_rate,
+                            self.warmup_iters,
+                            self.cosine_cycle_iters)
+        state = self.optimizer.state

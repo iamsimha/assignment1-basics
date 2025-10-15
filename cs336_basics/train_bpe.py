@@ -3,6 +3,7 @@ import regex as re
 import pickle
 import os
 import time
+import numpy as np
 from itertools import tee
 from typing import IO, Any, BinaryIO
 from collections import defaultdict
@@ -544,9 +545,12 @@ if __name__ == "__main__":
     # tokenize_corpus("../tests/fixtures/tinystories_sample_5M.txt",
     #                 "../tests/fixtures/tokenizers/tinystories",
     #                 "../data/tokenized/tinystories_sample_5M.bin")
-    tokenize_corpus("../tests/fixtures/tinystories_train.txt",
+    tokenize_corpus("../data/raw/TinyStoriesV2-GPT4-valid.txt",
                     "../tests/fixtures/tokenizers/tinystories",
-                    "../data/tokenized/tinystories_train.bin")
+                    "../data/tokenized/TinyStoriesV2-GPT4-valid.bin")
+    tokenize_corpus("../data/raw/TinyStoriesV2-GPT4-train.txt",
+                    "../tests/fixtures/tokenizers/tinystories",
+                    "../data/tokenized/TinyStoriesV2-GPT4-train.bin")
     # tokenize_corpus("../tests/fixtures/openwebtext.txt",
     #                 "../tests/fixtures/tokenizers/openwebtext",
     #                 "../data/tokenized/openwebtext.bin")

@@ -1,0 +1,41 @@
+defaults:
+  - _self_
+  - override hydra/launcher: submitit_local
+  
+
+train_dataset_path: "../data/tokenized/TinyStoriesV2-GPT4-train.bin"
+validation_dataset_path: "../data/tokenized/TinyStoriesV2-GPT4-valid.bin"
+max_training_tokens: 40_000_000
+experiment_name: transformer_learning_rate_sweep
+run_name: "${now:%Y%m%d}_${now:%H%M%S}_${hydra:job.name}"
+checkpoint_path: "../checkpoints/transformer_hyperparam"
+val_batch_size: 128
+log_every: 200
+save_every: 500
+optimizer: AdamW
+transformer_arch_params:
+  vocab_size: 10000
+  context_length: 256
+  d_model: 512
+  d_ff: 1334
+  theta: 10000
+  n_layers: 4
+  n_heads: 16
+  pre_norm: True
+  use_rope: True
+hydra:
+  mode: MULTIRUN
+  launcher:
+    # n_jobs: 4 
+    gpus_per_node: 8
+    tasks_per_node: 1
+    cpus_per_task: 4
+    timeout_min: 1440
+  sweeper:
+    params:
+      lr: 1,1e-1,1e-2,1e-3,1e-4
+      train_batch_size: 32,64
+      transformer_arch_params.pre_norm: True
+      transformer_arch_params.use_rope: True
+lr: ???
+train_batch_size: ???

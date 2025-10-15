@@ -19,7 +19,7 @@ from cs336_basics.nn_ops import softmax, silu
 from cs336_basics.nn_attn import scaled_dot_product_attn, MultiHeadSelfAttn
 from cs336_basics.nn_transformer import TransformerBlock, Transformer
 from cs336_basics.nn_loss import cross_entropy
-from cs336_basics.nn_optim import AdamW, get_lr_schedule, clip_gradients
+from cs336_basics.nn_optim import AdamW, get_cosine_lr_schedule, clip_gradients
 from cs336_basics.nn_data import get_batch
 from cs336_basics.nn_serialization import save_checkpoint, load_checkpoint
 
@@ -538,7 +538,7 @@ def run_get_lr_cosine_schedule(
     Returns:
         Learning rate at the given iteration under the specified schedule.
     """
-    return get_lr_schedule(it, max_learning_rate,
+    return get_cosine_lr_schedule(it, max_learning_rate,
                     min_learning_rate, warmup_iters,
                     cosine_cycle_iters)
 
